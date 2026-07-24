@@ -861,8 +861,16 @@ bool SensorService::threadLoop() {
                 device.reconnect();
                 continue;
             } else {
-                ALOGE("sensor poll failed (%s)", strerror(-count));
-                break;
+                // Diagnostic: this vendor sensors HAL's poll() surfaces a
+                // transient EINTR (observed here whenever ActivityManager's
+                // ANR handler ptrace-dumps stacks across processes, which
+                // briefly interrupts this thread's blocking call) as a
+                // generic, unrelated-looking error instead of retrying it
+                // internally. That used to fall through to the
+                // ALOGW/abort() below, crashing all of system_server over
+                // a transient, self-recovering condition. Retry instead.
+                ALOGE("sensor poll failed (%s), retrying", strerror(-count));
+                continue;
             }
         }
 
