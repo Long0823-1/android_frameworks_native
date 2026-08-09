@@ -29,6 +29,8 @@
 #include <sync/sync.h>
 #pragma clang diagnostic pop
 
+#include <mutex>
+
 #include <utils/Log.h>
 #include <utils/Trace.h>
 
@@ -42,6 +44,25 @@
 
 namespace android {
 // ---------------------------------------------------------------------------
+
+// suez (MT8173): serializes every call into the vendor gralloc mapper
+// (gralloc.mt8173.img.so) that can touch its internal per-buffer
+// registry/pool -- import, free, and register/unregister via
+// importBuffer()/freeBuffer(). That blob's freeBuffer() SIGSEGVs (and once,
+// escalated into a kernel SError/full panic) on certain buffers, always
+// during a burst of concurrent buffer churn from multiple threads (video
+// decoder teardown; many apps' surfaces being torn down together on a
+// screen-off transition) -- consistent with a thread-safety bug in the
+// vendor's own internal lookup table rather than a straightforward logic
+// bug. A prior attempt worked around this by skipping the vendor call
+// entirely (native_handle_close() instead), which avoided the crash but
+// broke whatever buffer pooling depends on real freeBuffer() calls,
+// causing severe device-wide slowdown -- reverted. This is a different,
+// much less invasive attempt: keep calling the real vendor functions
+// (preserving pooling), just never let two calls run concurrently.
+// Recursive: importBuffer() below can call this file's own freeBuffer() on
+// its error path while already holding the lock.
+static std::recursive_mutex sVendorMapperMutex;
 
 ANDROID_SINGLETON_STATIC_INSTANCE( GraphicBufferMapper )
 
@@ -89,6 +110,8 @@ status_t GraphicBufferMapper::importBuffer(buffer_handle_t rawHandle,
 {
     ATRACE_CALL();
 
+    std::lock_guard<std::recursive_mutex> lock(sVendorMapperMutex);
+
     buffer_handle_t bufferHandle;
     status_t error = mMapper->importBuffer(hardware::hidl_handle(rawHandle), &bufferHandle);
     if (error != NO_ERROR) {
@@ -119,6 +142,15 @@ status_t GraphicBufferMapper::freeBuffer(buffer_handle_t handle)
 {
     ATRACE_CALL();
 
+    // suez (MT8173): see sVendorMapperMutex's comment above. A prior attempt
+    // routed every buffer free through native_handle_close() instead of the
+    // real vendor mapper, to dodge gralloc.mt8173.img.so's freeBuffer()
+    // crash entirely -- that avoided the crash but broke vendor-side buffer
+    // pooling, causing severe device-wide slowdown, and was reverted. This
+    // keeps calling the real mapper (pooling intact) and instead serializes
+    // access, on the theory that the crash is a thread-safety bug in the
+    // vendor's internal buffer registry rather than a plain logic bug.
+    std::lock_guard<std::recursive_mutex> lock(sVendorMapperMutex);
     mMapper->freeBuffer(handle);
 
     return NO_ERROR;
